@@ -17,7 +17,8 @@ def test_dev_disables_certificate_verification():
 
 
 def test_unknown_environment_is_rejected():
-    with pytest.raises(SystemExit):
+    """1.0 raises ValueError; 0.3 called raise SystemExit."""
+    with pytest.raises(ValueError, match="Unknown Drupal environment"):
         Drupal(DOMAIN, "staging", "u", "p")
 
 

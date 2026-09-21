@@ -3,10 +3,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-import pytest
-
 from conftest import DOMAIN, make_response
-
 
 # --- get_drupal_entity_collection ------------------------------------------
 

@@ -1,26 +1,76 @@
-"""Necessary classes and modules"""
-import pprint
-import copy
+"""HTTP client for the Drupal JSON:API."""
+from __future__ import annotations
+
+import collections.abc
+import datetime as _datetime
 import json
-import collections
-import urllib
-import sys
-from bson import json_util
+import logging
+import urllib.error
+import urllib.request
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
 import requests
 import urllib3
 from fake_useragent import UserAgent
 
+from drupal_api.exceptions import DrupalAPIError
+
+logger = logging.getLogger(__name__)
+
+#: Seconds before an individual HTTP request is abandoned.
+DEFAULT_TIMEOUT = 30
+#: Characters of a non-JSON error body kept for diagnostics.
+ERROR_BODY_LIMIT = 500
+
+QueryParameters = Sequence[tuple] | Mapping[str, Any]
+
+
+def json_default(value: Any) -> str:
+    """Serialise values ``json.dumps`` cannot handle natively.
+
+    Dates and datetimes become ISO-8601 strings, which is what Drupal's
+    JSON:API expects for date fields.
+    """
+    if isinstance(value, (_datetime.datetime, _datetime.date)):
+        return value.isoformat()
+
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
 
 class Drupal:
+    """Authenticated client for one Drupal site's JSON:API.
+
+    Parameters
+    ----------
+    domain:
+        Base URL of the site, e.g. ``https://example.com``.
+    environment:
+        ``"prod"`` verifies TLS certificates; ``"dev"`` disables verification
+        for self-signed certificates and silences the matching warning.
+    username, password:
+        Credentials for HTTP basic authentication.
+    timeout:
+        Seconds before a request is abandoned. Defaults to
+        :data:`DEFAULT_TIMEOUT`.
+
+    Raises
+    ------
+    ValueError
+        If ``environment`` is neither ``"prod"`` nor ``"dev"``.
+    """
+
     def __init__(
         self,
         domain: str,
         environment: str,
         username: str,
-        password: str
-    ):
+        password: str,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> None:
         self.domain = domain
-        self.request_verification = None
+        self.timeout = timeout
 
         if environment == "prod":
             self.request_verification = True
@@ -28,7 +78,9 @@ class Drupal:
             self.request_verification = False
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         else:
-            raise SystemExit(f"There is no Drupal environment chosen")
+            raise ValueError(
+                f"Unknown Drupal environment {environment!r}; expected 'prod' or 'dev'"
+            )
 
         self.json_api_username = username
         self.json_api_password = password
@@ -37,391 +89,302 @@ class Drupal:
             "Content-Type": "application/vnd.api+json",
         }
 
-    def get_entities(
-        self,
-        url: str,
-        **kwargs
-    ):
+    # --- internals ---------------------------------------------------------
+
+    def _absolute_url(self, url: str) -> str:
+        """Prefix ``url`` with the site domain unless it already carries it."""
+        if url.startswith(self.domain):
+            return url
+
+        return self.domain + url
+
+    @staticmethod
+    def _describe_error_body(response: requests.Response) -> Any:
+        """Return the response body for diagnostics, JSON when possible.
+
+        Never raises: an error response is often HTML or empty, and failing
+        here would mask the HTTP error the caller actually needs to see.
         """
-        Get entities from a given URL.
+        try:
+            return response.json()
+        except ValueError:
+            text = (response.text or "").strip()
+            return text[:ERROR_BODY_LIMIT] if text else None
 
-        This method makes an HTTP GET request to the given URL using the
-        `requests` library to retrieve entities. The request is authenticated
-        using the credentials provided during object instantiation. The
-        response is checked for any HTTP errors, and if any are encountered,
-        the error message is printed along with the response JSON, and the
-        program is exited with a status code of 0.
-
-        Parameters
-        ----------
-        url : str
-            The URL from which entities need to be retrieved.
-        **kwargs : dict, optional
-            Optional keyword arguments that can be passed to the
-            `requests.get()` method, such as query parameters and headers.
-
-        Returns
-        -------
-        requests.Response
-            The response object returned by the `requests.get()` method, which
-            contains the entities retrieved from the given URL.
-
-        Notes
-        -----
-        - This method relies on the availability and consistency of the given
-          URL, and the authentication credentials provided during object
-          instantiation.
-
-        - The `headers`, `params`, `verify`, and `auth` arguments of the
-          `requests.get()` method are used to configure the HTTP request made
-          by this method.
-
-        - The `response` object returned by the `requests.get()` method is
-          checked for HTTP errors using the `raise_for_status()` method. If any
-          HTTP errors are encountered, the error message is printed along with
-          the response JSON, and the program is exited with a status code of 0.
-
-        - This method is responsible for making an authenticated HTTP GET
-          request to the given URL and retrieving the entities from it.
-        """
-
-        current_url = ''
-
-        if url.find(self.domain) == -1:
-            current_url = self.domain + url
-        else:
-            current_url = url
-
-        response = requests.get(
-            current_url,
-            headers=self.default_headers,
-            params=kwargs.get("parameters", {}),
-            verify=self.request_verification,
-            auth=(self.json_api_username, self.json_api_password)
-        )
-
+    def _raise_for_status(self, response: requests.Response) -> None:
+        """Convert an unsuccessful response into :class:`DrupalAPIError`."""
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as error:
-            print(error)
-            pprint.pprint(response.json())
-            sys.exit(0)
+            body = self._describe_error_body(response)
+            logger.error("Drupal request failed: %s | body=%s", error, body)
+            raise DrupalAPIError(
+                str(error),
+                status_code=response.status_code,
+                url=response.url,
+                body=body,
+                response=response,
+            ) from error
 
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
+        data: Any = None,
+    ) -> requests.Response:
+        """Send one authenticated request and raise on an error status."""
+        request_method = getattr(requests, method)
+        response = request_method(
+            url,
+            headers=dict(headers if headers is not None else self.default_headers),
+            params=params,
+            data=data,
+            verify=self.request_verification,
+            auth=(self.json_api_username, self.json_api_password),
+            timeout=self.timeout,
+        )
+
+        self._raise_for_status(response)
         return response
 
-    def get_drupal_entity_collection(
-        self,
-        url: str,
-        **kwargs
-    ):
-        """
-        Retrieves a collection of entities from Drupal using the specified URL
-        and query parameters. This method fetches entities in paginated batches
-        and accumulates them in a list until all entities are retrieved. The
-        retrieved entities are returned as a list.
+    # --- reading -----------------------------------------------------------
+
+    def get_entities(self, url: str, **kwargs: Any) -> requests.Response:
+        """Retrieve entities from ``url``.
 
         Parameters
         ----------
-            url : str
-                The URL endpoint to retrieve the entities from. This should be
-                the endpoint specific to the entity type being retrieved,
-                e.g., '/jsonapi/node' for nodes or '/jsonapi/taxonomy_term' for
-                taxonomy terms.
-            **kwargs :
-                Additional keyword arguments to be included as query parameters
-                in the API request. These parameters can be used to filter or
-                paginate the results, and should be provided as keyword
-                arguments, where the keyword represents the parameter name and
-                the value represents the parameter value.
+        url:
+            Absolute URL, or a path such as ``/jsonapi/node/article`` which is
+            resolved against the site domain.
+        **kwargs:
+            ``parameters`` is forwarded to ``requests`` as the query string.
+            Pass a list of two-tuples to keep the order stable.
 
-        Returns
-        -------
-            list:
-                A list of entities retrieved from Drupal.
-
-        Notes
-        -----
-            - This method makes use of the 'get_entities' method, which is
-              assumed to be implemented elsewhere in the codebase. Please
-              ensure  that the 'get_entities' method is properly implemented
-              and available for use with this method.
-            - The retrieved entities are accumulated in a list, and the
-              pagination is handled internally until all entities are
-              retrieved. This may result in multiple requests to the Drupal
-              API, depending on the number of entities and the page size
-              configured on the Drupal server.
-            - The 'url' argument should be provided as a string, and should be
-              specific to the entity type being retrieved, including the API
-              endpoint and any additional path or query parameters.
-            - Additional query parameters can be provided as keyword arguments,
-              where the keyword represents the parameter name and the value
-              represents the parameter value. These parameters can be used to
-              filter or paginate the results as needed.
+        Raises
+        ------
+        DrupalAPIError
+            If the request fails or returns an error status.
         """
+        return self._request(
+            "get",
+            self._absolute_url(url),
+            params=kwargs.get("parameters"),
+        )
 
-        entities_list = []
+    def get_drupal_entity_collection(self, url: str, **kwargs: Any) -> list:
+        """Retrieve every entity from a paginated collection.
 
-        next_page = True
-        counter = 0
-        current_url = self.domain + url
+        Follows JSON:API ``next`` links until the collection is exhausted and
+        returns the accumulated entities. Returns an empty list when the
+        collection is empty.
+        """
+        entities_list: list = []
+        current_url = self._absolute_url(url)
+        query = kwargs.get("query")
 
-        while next_page:
-            entity_page = self.get_entities(
-                current_url,
-                parameters=kwargs.get("query", {})
-            ).json()
+        while True:
+            entity_page = self.get_entities(current_url, parameters=query).json()
+            page_data = entity_page.get("data", [])
 
-            if len(entity_page["data"]) == 0:
-                return {}
+            if not page_data:
+                break
 
-            entities_list.extend(entity_page["data"])
-
-            counter += len(entity_page["data"])
-            print(
-                f"Retrieved {counter} nodes of "
-                f"content type {url.split('/')[-1]}",
-                end="\r"
+            entities_list.extend(page_data)
+            logger.info(
+                "Retrieved %s entities of type %s",
+                len(entities_list),
+                url.rstrip("/").split("/")[-1],
             )
 
-            if "next" in entity_page["links"]:
-                current_url = entity_page["links"]["next"]["href"]
-            else:
-                next_page = False
+            next_link = entity_page.get("links", {}).get("next")
 
-        print()
+            if not next_link:
+                break
+
+            current_url = next_link["href"]
+            # Pagination links already carry the query string.
+            query = None
 
         return entities_list
+
+    # --- writing -----------------------------------------------------------
 
     def post_entity(
         self,
         entity_url: str,
-        data_package: dict,
-        file=False,
-        filename=""
-    ):
-        this_header = copy.deepcopy(self.default_headers)
-        data = {}
+        data_package: Any,
+        file: bool = False,
+        filename: str = "",
+    ) -> requests.Response:
+        """Create an entity, or upload a file when ``file`` is True.
+
+        Raises
+        ------
+        DrupalAPIError
+            If the request fails or returns an error status.
+        """
+        headers = dict(self.default_headers)
 
         if file:
-            this_header["Content-Disposition"] = "file; filename=\"" + \
-                filename + "\""
-            this_header["Content-Type"] = "application/octet-stream"
+            headers["Content-Disposition"] = f'file; filename="{filename}"'
+            headers["Content-Type"] = "application/octet-stream"
             data = data_package
         else:
-            data = json.dumps(data_package, default=json_util.default)
+            data = json.dumps(data_package, default=json_default)
 
-        response = requests.post(
-            self.domain + entity_url,
-            headers=this_header,
+        return self._request(
+            "post",
+            self._absolute_url(entity_url),
+            headers=headers,
             data=data,
-            verify=self.request_verification,
-            auth=(self.json_api_username, self.json_api_password)
         )
 
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as error:
-            print(error)
-            pprint.pprint(response.json())
-            sys.exit(0)
+    def update_entity(self, entity_url: str, data_package: Any) -> requests.Response:
+        """Patch an existing entity.
 
-        return response
-
-    def update_entity(
-        self,
-        entity_url: str,
-        data_package: dict
-    ):
-        response = requests.patch(
-            self.domain + entity_url,
-            headers=self.default_headers,
-            data=json.dumps(data_package, default=json_util.default),
-            verify=self.request_verification,
-            auth=(self.json_api_username, self.json_api_password)
+        Raises
+        ------
+        DrupalAPIError
+            If the request fails or returns an error status.
+        """
+        return self._request(
+            "patch",
+            self._absolute_url(entity_url),
+            data=json.dumps(data_package, default=json_default),
         )
 
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as error:
-            print(error)
-            pprint.pprint(response.json())
-            sys.exit(0)
+    def delete_entity(self, entity_url: str) -> requests.Response:
+        """Delete an entity.
 
-        return response
+        Raises
+        ------
+        DrupalAPIError
+            If the request fails or returns an error status.
+        """
+        return self._request("delete", self._absolute_url(entity_url))
 
-    def delete_entity(
-        self,
-        entity_url
-    ):
-        response = requests.delete(
-            self.domain + entity_url,
-            headers=self.default_headers,
-            verify=self.request_verification,
-            auth=(self.json_api_username, self.json_api_password)
-        )
-
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as error:
-            print(error)
-            pprint.pprint(response.json())
-            sys.exit(0)
-
-        return response
+    # --- higher-level helpers ----------------------------------------------
 
     def get_taxonomy_term(
         self,
-        postUrl: str,
+        post_url: str,
         data: dict,
-        extraData: dict = {}
-    ):
-        params = {
+        extra_data: dict | None = None,
+    ) -> Any:
+        """Return the taxonomy term matching ``data``, creating it if absent."""
+        params = [
             ("filter[a-label][condition][path]", "name"),
             ("filter[a-label][condition][operator]", "="),
-            ("filter[a-label][condition][value]",
-             data["data"]["attributes"]["name"]),
-        }
+            ("filter[a-label][condition][value]", data["data"]["attributes"]["name"]),
+        ]
 
-        taxonomy_term_response = self.get_entities(postUrl, parameters=params)
+        taxonomy_term_response = self.get_entities(post_url, parameters=params)
+        existing_terms = taxonomy_term_response.json()["data"]
 
-        if len(json.loads(taxonomy_term_response.text)["data"]) == 0:
-            data_to_send = {}
+        if existing_terms:
+            return existing_terms[0]
 
-            if len(extraData) != 0:
-                data_to_send = self.merge_dicts(data, extraData)
-            else:
-                data_to_send = data
+        data_to_send = self.merge_dicts(data, extra_data) if extra_data else data
+        created_response = self.post_entity(post_url, data_to_send)
 
-            created_taxonomy_term_response = self.post_entity(
-                postUrl, data_to_send)
+        return created_response.json()["data"]
 
-            return json.loads(created_taxonomy_term_response.text)["data"]
+    @staticmethod
+    def merge_dicts(dict1: dict, dict2: Mapping[Any, Any]) -> dict:
+        """Recursively merge ``dict2`` into ``dict1`` and return ``dict1``.
 
-        return json.loads(taxonomy_term_response.text)["data"][0]
-
-    def merge_dicts(
-        self,
-        dict1: dict,
-        dict2: dict
-    ):
-        """ Recursive dict merge. Inspired by :meth:``dict.update()``, instead of
-        updating only top-level keys, dict2 recurses down into dicts nested
-        to an arbitrary depth, updating keys. The ``dict2`` is merged into
-        ``dict1``.
-        :param dict1: dict onto which the merge is executed
-        :param dict2: dct merged into dct
-        :return: None
+        Unlike :meth:`dict.update`, nested dictionaries are merged key by key
+        rather than replaced wholesale.
         """
-        for k, v in dict2.items():
-            if (k in dict1 and isinstance(dict1[k], dict)
-                    and isinstance(dict2[k], collections.Mapping)):
-                self.merge_dicts(dict1[k], dict2[k])
+        for key, value in dict2.items():
+            if (
+                key in dict1
+                and isinstance(dict1[key], dict)
+                and isinstance(value, collections.abc.Mapping)
+            ):
+                Drupal.merge_dicts(dict1[key], value)
             else:
-                dict1[k] = dict2[k]
+                dict1[key] = value
 
         return dict1
 
-    def get_file_id(
-        self,
-        drupal_field_url: str,
-        **kwargs
-    ):
-        """
-        Retrieves the UUID of a file from the Drupal website or uploads the file
-        if it does not exist yet.
+    def get_file_id(self, drupal_field_url: str, **kwargs: Any) -> str:
+        """Return the UUID of a file, uploading it when it does not exist yet.
 
         Parameters
         ----------
-            drupal_field_url : str
-                the string object representing the url of the field to which
-                the file will be uploaded. This has the example format:
-                '/jsonapi/[node]/[content type]/[field name]'
-            file_url_or_path : str
-                the string object representing the URL or the local path of the
-                file
-            filename : str
-                the string object representing the filename
-            local_file : bool
-                the boolean object that determines whether the file is
-                uploaded locally from the computer or downloaded through
-                a URL
-        """
+        drupal_field_url:
+            File field endpoint, e.g.
+            ``/jsonapi/media/image/field_media_image``.
+        file_url_or_path:
+            URL or local path of the file.
+        filename:
+            Overrides the name derived from ``file_url_or_path``.
+        local_file:
+            Read from disk instead of downloading. Defaults to False.
+        file_bytes:
+            Pre-read content, skipping both disk and network.
 
-        filename = kwargs.get("filename", None)
-        file_url_or_path = kwargs.get("file_url_or_path", None)
+        Raises
+        ------
+        DrupalAPIError
+            If a request fails or returns an error status.
+        """
+        filename = kwargs.get("filename")
+        file_url_or_path = kwargs.get("file_url_or_path")
 
         if filename is None:
-            splitted_url = file_url_or_path.split("/")
+            filename = [part for part in str(file_url_or_path).split("/") if part][-1]
 
-            if splitted_url[len(splitted_url) - 1] == "":
-                filename = splitted_url[len(splitted_url) - 2]
-            else:
-                filename = splitted_url[len(splitted_url) - 1]
-
-        params = {
+        params = [
             ("filter[a-label][condition][path]", "filename"),
             ("filter[a-label][condition][operator]", "="),
             ("filter[a-label][condition][value]", filename),
-        }
+        ]
 
-        file_response = self.get_entities(
-            self.domain + "/jsonapi/file/file", parameters=params)
+        file_response = self.get_entities("/jsonapi/file/file", parameters=params)
+        existing_files = file_response.json()["data"]
 
-        uuid = None
+        if existing_files:
+            return existing_files[0]["id"]
 
-        if len(file_response.json()["data"]) == 0:
-            file_bytes = kwargs.get("file_bytes", None)
+        file_bytes = kwargs.get("file_bytes")
 
-            if file_bytes is None:
-                local_file = kwargs.get("local_file", False)
-
-                file_bytes = self.__get_file_bytes(
-                    local_file,
-                    file_url_or_path
-                )
-
-            uploaded_file_response = self.post_entity(
-                drupal_field_url,
-                file_bytes,
-                True,
-                filename
+        if file_bytes is None:
+            file_bytes = self._get_file_bytes(
+                kwargs.get("local_file", False), file_url_or_path
             )
 
-            uuid = uploaded_file_response.json()["data"]["id"]
-        else:
-            uuid = file_response.json()["data"][0]["id"]
+        uploaded_file_response = self.post_entity(
+            drupal_field_url, file_bytes, True, filename
+        )
 
-        return uuid
+        return uploaded_file_response.json()["data"]["id"]
 
-    @classmethod
-    def __get_file_bytes(
-        cls,
-        local_file: bool,
-        file_url_or_path: str
-    ):
-        file_bytes = None
-
+    @staticmethod
+    def _get_file_bytes(local_file: bool, file_url_or_path: Any) -> bytes:
+        """Read a file from disk, or download it over HTTP."""
         if local_file:
-            with open(file_url_or_path, "rb") as file_to_read:
-                loaded_file = file_to_read.read()
-                file_byte_array = bytearray(loaded_file)
-                file_bytes = bytes(file_byte_array)
-        else:
-            try:
-                user_agent = UserAgent()
-                headers = {"User-Agent": user_agent.random}
+            with Path(file_url_or_path).open("rb") as file_to_read:
+                return file_to_read.read()
 
-                custom_request = urllib.request.Request(
-                    file_url_or_path,
-                    headers=headers
-                )
+        url = str(file_url_or_path)
 
-                file_bytes = urllib.request.urlopen(custom_request).read()
-            except urllib.error.HTTPError as error:
-                print(error)
-                sys.exit(0)
-            except urllib.error.URLError as error:
-                print(error)
-                sys.exit(0)
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError(f"Refusing to fetch non-HTTP(S) URL: {url!r}")
 
-        return file_bytes
+        try:
+            # Scheme is validated above, so this is not an arbitrary-URL open.
+            custom_request = urllib.request.Request(  # noqa: S310
+                url, headers={"User-Agent": UserAgent().random}
+            )
+
+            with urllib.request.urlopen(custom_request, timeout=DEFAULT_TIMEOUT) as handle:  # noqa: S310
+                return handle.read()
+        except (urllib.error.HTTPError, urllib.error.URLError) as error:
+            logger.error("Could not download %s: %s", url, error)
+            raise DrupalAPIError(f"Could not download {url}: {error}", url=url) from error
